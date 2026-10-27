@@ -25,7 +25,7 @@
     account under both names; 'save' now refuses to do that.
 
     IMPORTANT: run this from a normal PowerShell window, not from inside
-    Claude. It force-closes the app, which would kill the session running it.
+    Claude. Exit Claude normally before switching so its history is flushed.
 #>
 
 [CmdletBinding()]
@@ -56,7 +56,9 @@ $ClaudeJson = Join-Path $env:USERPROFILE '.claude.json'
 $Store      = Join-Path $env:USERPROFILE '.claude-profiles'
 $Marker     = Join-Path $Store 'current.txt'
 
-# The desktop app is an MSIX package. Depending on which shell you run from,
+# Current MSIX builds migrate user data to Local\Claude-Data\<package family>.
+# Prefer that location so an old redirected copy is never selected after migration.
+# Depending on which shell you run from,
 # %APPDATA% may resolve to the real Roaming folder or to the package's
 # redirected view. They are the same underlying files, but only one of the two
 # is guaranteed visible from any given process -- so probe rather than assume.
@@ -86,6 +88,7 @@ function Get-ClaudeAumid {
 function Resolve-AppRoot {
     $fam = Get-ClaudePackageFamily
     $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Claude-Data\$fam"),
         (Join-Path $env:APPDATA 'Claude'),
         (Join-Path $env:LOCALAPPDATA "Packages\$fam\LocalCache\Roaming\Claude")
     )
@@ -125,6 +128,8 @@ $AppConfig  = Join-Path $AppRoot 'config.json'
 # over cookies from another (undecryptable). The named profile is intact in the
 # store, so we can re-apply it to return to a known-good state.
 $SwitchMarker = Join-Path $Store '.switch-in-progress'
+$HistorySwitchMarker = Join-Path $Store '.history-switch-in-progress.json'
+$HistoryScript = Join-Path $PSScriptRoot 'claude-history-sync.mjs'
 
 # One profile mutation at a time across every process (watcher + GUI + CLI). Two
 # concurrent Restore-Profile runs over the same six files is the fastest route to
@@ -281,8 +286,13 @@ function Test-FileUnlocked {
 function Stop-ClaudeApp {
     $procs = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
     if ($procs) {
-        Write-Host "Closing Claude ($($procs.Count) process(es))..." -ForegroundColor Yellow
-        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Killing Electron can lose its last index update and kill background
+        # workers without saving their state. The user can review any quit
+        # confirmation; if Claude stays in the tray, require File > Exit.
+        Write-Host 'Requesting Claude to close normally...' -ForegroundColor Yellow
+        foreach ($p in $procs) {
+            if ($p.MainWindowHandle -ne [IntPtr]::Zero) { [void]$p.CloseMainWindow() }
+        }
     }
 
     for ($i = 0; $i -lt 40; $i++) {
@@ -296,9 +306,73 @@ function Stop-ClaudeApp {
     }
 
     if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) {
-        throw "Claude processes did not exit. Close the app manually and retry."
+        throw "Claude is still running. Use Claude's File > Exit, then retry the switch. No account or history was changed."
     }
     throw "Claude exited but '$CookieDb' is still locked. Wait a few seconds and retry."
+}
+
+function Assert-ClaudeClosed {
+    if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) {
+        throw 'Claude reopened during the switch. Exit it normally, then retry; session recovery is preserved.'
+    }
+}
+
+function Assert-HistoryRuntime {
+    if (-not (Test-Path -LiteralPath $HistoryScript -PathType Leaf)) {
+        throw 'The history-sync engine is missing. Reinstall all switcher files before switching.'
+    }
+    $script:HistoryNode = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $script:HistoryNode) { throw 'Node.js 18 or newer is required to preserve session history. Install it before switching.' }
+    $version = & $script:HistoryNode.Source --version
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 18) {
+        throw 'Node.js 18 or newer is required to preserve session history.'
+    }
+}
+
+function Invoke-HistorySync {
+    param([string]$Mode, [string]$SourceAccount, [string]$TargetAccount, [string]$Transaction)
+    Assert-HistoryRuntime
+    Assert-ClaudeClosed
+    $nodeArgs = @($HistoryScript, '--mode', $Mode)
+    if ($Mode -eq 'prepare') {
+        $nodeArgs += @('--app-root', $AppRoot, '--user-root', $env:USERPROFILE, '--source', $SourceAccount, '--target', $TargetAccount)
+    } else { $nodeArgs += @('--transaction', $Transaction) }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $script:HistoryNode.Source @nodeArgs 2>&1
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+    if ($code -ne 0) { throw "Session history $Mode failed; the switch was stopped.`n$text" }
+    try { $result = $text | ConvertFrom-Json } catch { throw 'History engine returned an invalid result; the switch was stopped.' }
+    if (-not $result.ok) { throw 'History engine did not confirm success; the switch was stopped.' }
+    return $result
+}
+
+function Write-HistorySwitchMarker {
+    param($Record)
+    $temp = $HistorySwitchMarker + '.new'
+    Write-Text $temp ($Record | ConvertTo-Json -Depth 8)
+    Move-Item -LiteralPath $temp -Destination $HistorySwitchMarker -Force
+}
+
+function Repair-HistorySwitch {
+    if (-not (Test-Path -LiteralPath $HistorySwitchMarker)) { return }
+    Assert-ClaudeClosed
+    if (Test-Path -LiteralPath $SwitchMarker) { throw 'Account recovery is unfinished; history recovery must wait.' }
+    $record = Get-Content -LiteralPath $HistorySwitchMarker -Raw | ConvertFrom-Json
+    $allowedRoot = [IO.Path]::GetFullPath((Join-Path $Store '.history-backups\transactions')) + [IO.Path]::DirectorySeparatorChar
+    $transaction = [IO.Path]::GetFullPath([string]$record.transactionPath)
+    if (-not $transaction.StartsWith($allowedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'History recovery path is outside the backup store.' }
+    $live = Get-AppAccountUuid
+    if ($live -eq $record.targetAccount) {
+        $null = Invoke-HistorySync -Mode apply -Transaction $transaction
+    } elseif ($live -eq $record.sourceAccount) {
+        $null = Invoke-HistorySync -Mode rollback -Transaction $transaction
+    } else { throw 'The active account changed during an interrupted switch. History backups were preserved; review before retrying.' }
+    Remove-Item -LiteralPath $HistorySwitchMarker -Force
+    Write-Host 'Recovered the interrupted session-history transfer.' -ForegroundColor DarkGray
 }
 
 # --- Copy primitives ---------------------------------------------------------
@@ -428,7 +502,8 @@ function Restore-Profile {
         throw
     }
 
-    Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $SwitchMarker -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $SwitchMarker) { throw 'Account recovery marker could not be cleared; recovery state was preserved.' }
     Remove-Item $rollback -Recurse -Force -ErrorAction SilentlyContinue
     Write-Text $Marker $ProfileName
 }
@@ -467,9 +542,7 @@ function Repair-IfInterrupted {
     Write-Host ""
 
     if (-not $target -or -not (Test-ProfileComplete $target)) {
-        Remove-Item $SwitchMarker -Force -ErrorAction SilentlyContinue
-        Write-Warning "Cannot auto-repair: profile '$target' is missing or incomplete. If Claude asks you to sign in, that is why."
-        return
+        throw "Cannot auto-repair: profile '$target' is missing or incomplete. Recovery markers and backups were preserved; restore that profile before retrying."
     }
     $procs = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
     if ($procs) {
@@ -484,14 +557,21 @@ function Repair-IfInterrupted {
 
 if (-not (Test-Path $Store)) { New-Item -ItemType Directory -Path $Store -Force | Out-Null }
 
-# Recover from interrupted operations before doing anything else. Repair-Saves
-# is cheap and always safe (it only touches orphaned .backup-*/.staging-* dirs);
-# the interrupted-switch repair takes the lock if it acts.
-Repair-Saves
-if ((Test-Path $SwitchMarker) -and $Command -notin @('save','switch')) {
-    Enter-ProfileLock
-    try { Repair-IfInterrupted } finally { Exit-ProfileLock }
-}
+# A staging directory is only orphaned after the previous writer has released
+# the lock. Even read-only commands must wait before recovering a save, or they
+# could delete a different process's in-progress snapshot.
+Enter-ProfileLock
+try {
+    Repair-Saves
+    if ((Test-Path $SwitchMarker) -and $Command -notin @('save','switch')) {
+        Repair-IfInterrupted
+    }
+    if ((Test-Path -LiteralPath $HistorySwitchMarker) -and $Command -notin @('save','switch')) {
+        if ((Get-Process -Name 'claude' -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $SwitchMarker)) {
+            Write-Warning 'Session history recovery is pending. Exit Claude normally, then run the switcher again.'
+        } else { Repair-HistorySwitch }
+    }
+} finally { Exit-ProfileLock }
 
 # Guard messages are for humans. Without this, PowerShell renders every 'throw'
 # as a RuntimeException with a stack trace and the message repeated twice.
@@ -636,6 +716,8 @@ switch ($Command) {
         try {
             Repair-IfInterrupted
             Stop-ClaudeApp
+            Repair-IfInterrupted
+            Repair-HistorySwitch
             Save-Profile -ProfileName $Name
             Write-Text $Marker $Name
         } finally { Exit-ProfileLock }
@@ -650,36 +732,79 @@ switch ($Command) {
             throw "Profile '$Name' is incomplete. Re-save it while signed into that account."
         }
 
-        if ((Get-CurrentProfile) -eq $Name) {
-            Write-Host "Already on profile '$Name'." -ForegroundColor Yellow
-            break
-        }
-
         Enter-ProfileLock
         try {
-            Repair-IfInterrupted
-
-            # Read the outgoing profile AFTER repair. Repair-IfInterrupted can
-            # re-apply an interrupted switch and rewrite the current-profile
-            # marker, so a value captured earlier would name the wrong profile
-            # and the checkpoint below would overwrite it with the wrong session.
-            $cur = Get-CurrentProfile
-            if ($cur -eq $Name) {
-                Write-Host "Already on profile '$Name' after repair." -ForegroundColor Yellow
-            } else {
+            if ((Test-Path -LiteralPath $SwitchMarker) -or (Test-Path -LiteralPath $HistorySwitchMarker)) {
+                Assert-HistoryRuntime
                 Stop-ClaudeApp
-
-                # Re-save the outgoing profile first: tokens refresh during use,
-                # and skipping this rolls that account back to a stale session.
-                if ($cur -and (Test-Path (Join-Path $Store $cur))) {
-                    Save-Profile -ProfileName $cur -Quiet
-                    Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
-                } elseif (Get-CurrentEmail) {
-                    Write-Warning "Current session belongs to no saved profile and will be replaced."
-                }
-
-                Restore-Profile -ProfileName $Name
+                Repair-IfInterrupted
+                Repair-HistorySwitch
             }
+
+            # current.txt is only a hint: logging into another account directly
+            # in Claude leaves it stale. Compare the live identity, otherwise a
+            # switch can be skipped or checkpoint the wrong account over a saved
+            # profile. Read again after closing Claude before taking a snapshot.
+            $liveUuid = Get-AppAccountUuid
+            if ($liveUuid -and $liveUuid -eq (Get-ProfileUuid $Name)) {
+                Write-Text $Marker $Name
+                Write-Host "Already on profile '$Name'." -ForegroundColor Yellow
+                break
+            }
+
+            # Check prerequisites before asking the application to exit.
+            Assert-HistoryRuntime
+            Stop-ClaudeApp
+            Assert-ClaudeClosed
+            $sourceAccount = Get-AppAccountUuid
+            $targetAccount = Get-ProfileUuid $Name
+            if (-not $sourceAccount -or -not $targetAccount) { throw 'Cannot identify both accounts safely; the switch was stopped.' }
+            $cur = Get-LiveProfile
+
+            # Re-save only the profile whose identity matches the live session:
+            # tokens refresh during use, and must be retained for that account.
+            if ($cur) {
+                Save-Profile -ProfileName $cur -Quiet
+                Write-Host "Checkpointed outgoing profile '$cur'." -ForegroundColor DarkGray
+            } elseif (Get-CurrentEmail) {
+                Write-Warning "Current session belongs to no saved profile and will be replaced."
+            }
+
+            # Refresh indexes only after every history chain has been validated
+            # and backed up. Authentication is changed last, so a failed history
+            # check leaves the current account selected.
+            $history = Invoke-HistorySync -Mode prepare -SourceAccount $sourceAccount -TargetAccount $targetAccount
+            $historyRecord = [pscustomobject]@{
+                transactionPath = $history.transactionPath
+                sourceAccount = $sourceAccount
+                targetAccount = $targetAccount
+                targetProfile = $Name
+                phase = 'prepared'
+            }
+            Write-HistorySwitchMarker $historyRecord
+            try {
+                $synced = Invoke-HistorySync -Mode apply -Transaction $history.transactionPath
+                Assert-ClaudeClosed
+                $historyRecord.phase = 'switching-auth'
+                Write-HistorySwitchMarker $historyRecord
+                Restore-Profile -ProfileName $Name
+                if ((Get-AppAccountUuid) -ne $targetAccount) { throw 'The restored account identity did not match the selected profile.' }
+                Remove-Item -LiteralPath $HistorySwitchMarker -Force
+            } catch {
+                $switchFailure = $_
+                # A partial authentication restore retains its own recovery
+                # marker; finish that recovery before deciding which history
+                # version belongs to the live account.
+                if (-not (Test-Path -LiteralPath $SwitchMarker) -and (Get-AppAccountUuid) -eq $sourceAccount) {
+                    try {
+                        $null = Invoke-HistorySync -Mode rollback -Transaction $history.transactionPath
+                        Remove-Item -LiteralPath $HistorySwitchMarker -Force
+                    } catch { Write-Warning 'History recovery remains pending; the verified backup and transaction journal were preserved.' }
+                }
+                throw $switchFailure
+            }
+            Write-Host ("History preserved: {0} added, {1} refreshed, {2} kept." -f $history.added, $history.refreshed, $history.kept) -ForegroundColor Green
+            Write-Host ("History backup: {0}" -f $history.transactionPath) -ForegroundColor DarkGray
         } finally { Exit-ProfileLock }
 
         $acct = Get-ProfileAccount $Name

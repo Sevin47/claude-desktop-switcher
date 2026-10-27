@@ -27,11 +27,12 @@ $ScriptDir     = $PSScriptRoot
 $ProfileScript = Join-Path $ScriptDir 'claude-profile.ps1'
 $SessionScript = Join-Path $ScriptDir 'claude-sessions.ps1'
 $AutoScript    = Join-Path $ScriptDir 'claude-autoswitch.ps1'
+$HistoryScript = Join-Path $ScriptDir 'claude-history-sync.mjs'
 
-foreach ($s in @($ProfileScript, $SessionScript, $AutoScript)) {
+foreach ($s in @($ProfileScript, $SessionScript, $AutoScript, $HistoryScript)) {
     if (-not (Test-Path $s)) {
         [void][System.Windows.Forms.MessageBox]::Show(
-            "Missing: $s`n`nKeep all four scripts in the same folder.",
+            "Missing: $s`n`nKeep all switcher scripts and the history engine in the same folder.",
             'Claude Switcher', 'OK', 'Error')
         return
     }
@@ -60,6 +61,7 @@ function Get-ClaudeAumid {
 function Resolve-AppRoot {
     $fam = Get-ClaudePackageFamily
     foreach ($c in @(
+        (Join-Path $env:LOCALAPPDATA "Claude-Data\$fam"),
         (Join-Path $env:APPDATA 'Claude'),
         (Join-Path $env:LOCALAPPDATA "Packages\$fam\LocalCache\Roaming\Claude"))) {
         if (Test-Path (Join-Path $c 'config.json')) { return $c }
@@ -84,8 +86,14 @@ function Read-Trimmed {
 }
 
 function Get-LiveUuid {
-    if (-not $AppRoot) { return $null }
-    try { return (Get-Content (Join-Path $AppRoot 'config.json') -Raw | ConvertFrom-Json).lastKnownAccountUuid }
+    # Restoring an older profile can move app data back to the MSIX directory.
+    # Refresh shared paths so this window follows either migration direction.
+    try {
+        $script:AppRoot = Resolve-AppRoot
+        $script:SessionsRoot = if ($script:AppRoot) { Join-Path $script:AppRoot 'claude-code-sessions' } else { $null }
+        if (-not $script:AppRoot) { return $null }
+        return (Get-Content (Join-Path $script:AppRoot 'config.json') -Raw | ConvertFrom-Json).lastKnownAccountUuid
+    }
     catch { return $null }
 }
 
@@ -178,7 +186,7 @@ $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'Claude Account Switcher'
 $form.Size            = New-Object System.Drawing.Size(940, 700)
 $form.StartPosition   = 'CenterScreen'
-$form.MinimumSize     = New-Object System.Drawing.Size(820, 600)
+$form.MinimumSize     = $form.Size
 
 $header               = New-Object System.Windows.Forms.Label
 $header.Location      = New-Object System.Drawing.Point(14, 12)
@@ -270,6 +278,10 @@ function Show-Ask {
 $tabProfiles          = New-Object System.Windows.Forms.TabPage
 $tabProfiles.Text     = 'Accounts'
 $tabs.Controls.Add($tabProfiles)
+# TabPages keep their 200x100 default until the tab control creates its handle.
+# Establish the real page size before adding anchored controls, or the initial
+# resize stretches the lists and moves the action buttons outside the page.
+$tabProfiles.Size     = $tabs.DisplayRectangle.Size
 
 $lvProfiles           = New-Object System.Windows.Forms.ListView
 $lvProfiles.Location  = New-Object System.Drawing.Point(10, 12)
@@ -319,6 +331,7 @@ foreach ($b in $profButtons) {
 $tabSessions          = New-Object System.Windows.Forms.TabPage
 $tabSessions.Text     = 'Sessions'
 $tabs.Controls.Add($tabSessions)
+$tabSessions.Size     = $tabs.DisplayRectangle.Size
 
 $lblAcct              = New-Object System.Windows.Forms.Label
 $lblAcct.Text         = 'Account:'
@@ -366,12 +379,14 @@ $tabSessions.Controls.Add($lblSessHint)
 $tabWatcher           = New-Object System.Windows.Forms.TabPage
 $tabWatcher.Text      = 'Auto-switch'
 $tabs.Controls.Add($tabWatcher)
+$tabWatcher.Size      = $tabs.DisplayRectangle.Size
 
 # =============================== Tab: Warming ================================
 
 $tabWarm            = New-Object System.Windows.Forms.TabPage
 $tabWarm.Text       = 'Warming'
 $tabs.Controls.Add($tabWarm)
+$tabWarm.Size       = $tabs.DisplayRectangle.Size
 
 $lblWarmIntro          = New-Object System.Windows.Forms.Label
 $lblWarmIntro.Location = New-Object System.Drawing.Point(12, 10)
@@ -511,9 +526,9 @@ $lblMinWait2.Size     = New-Object System.Drawing.Size(70, 20)
 $tabWatcher.Controls.Add($lblMinWait2)
 
 $lblCarry             = New-Object System.Windows.Forms.Label
-$lblCarry.Text        = 'On failover, carry over sessions touched in the last'
+$lblCarry.Text        = 'Every switch backs up and synchronizes all local Code sessions.'
 $lblCarry.Location    = New-Object System.Drawing.Point(12, 168)
-$lblCarry.Size        = New-Object System.Drawing.Size(300, 20)
+$lblCarry.Size        = New-Object System.Drawing.Size(560, 20)
 $tabWatcher.Controls.Add($lblCarry)
 
 $numCarry             = New-Object System.Windows.Forms.NumericUpDown
@@ -522,10 +537,12 @@ $numCarry.Size        = New-Object System.Drawing.Size(60, 24)
 $numCarry.Minimum     = 5
 $numCarry.Maximum     = 1440
 $numCarry.Value       = 60
+$numCarry.Visible     = $false # Retain old startup arguments without offering an ineffective age filter.
 $tabWatcher.Controls.Add($numCarry)
 
 $lblCarry2            = New-Object System.Windows.Forms.Label
 $lblCarry2.Text       = 'min'
+$lblCarry2.Visible    = $false
 $lblCarry2.Location   = New-Object System.Drawing.Point(382, 168)
 $lblCarry2.Size       = New-Object System.Drawing.Size(40, 20)
 $tabWatcher.Controls.Add($lblCarry2)
@@ -961,7 +978,7 @@ $watchBtn['start'].Add_Click({
         [void][System.Windows.Forms.MessageBox]::Show('A watcher is already running.', 'Claude Switcher', 'OK', 'Information')
         return
     }
-    $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$AutoScript,'run')
+    $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',('"' + $AutoScript + '"'),'run')
     if ($chkDryRun.Checked)   { $a += '-DryRun' }
     if ($chkFiveHour.Checked) { $a += '-IncludeFiveHour'; $a += '-MinFiveHourWaitMinutes'; $a += [string][int]$numMinWait.Value }
     $a += '-CarryOverMinutes'; $a += [string][int]$numCarry.Value
@@ -970,7 +987,7 @@ $watchBtn['start'].Add_Click({
         $a += '-WarmIdleMinutes';    $a += [string][int]$numWarmIdle.Value
         $a += '-WarmStaggerMinutes'; $a += [string][int]$numWarmStag.Value
     }
-    Start-Process powershell.exe -ArgumentList $a
+    Start-Process powershell.exe -ArgumentList $a -WindowStyle Hidden
     Add-Output 'Started watcher (hidden).'
     Start-Sleep -Milliseconds 1200
     Update-All

@@ -19,6 +19,7 @@
       .\claude-sessions.ps1 accounts
       .\claude-sessions.ps1 list <account>
       .\claude-sessions.ps1 copy <sessionId> <targetAccount>
+      .\claude-sessions.ps1 copy <sessionId> <targetAccount> -TargetOrg <orgUuid>
 
     <account> accepts a profile name from claude-profile.ps1 (resolved via that
     profile's stored config.json, NOT its display label, which is unreliable)
@@ -35,7 +36,11 @@ param(
     [string]$Arg1,
 
     [Parameter(Position = 2)]
-    [string]$Arg2
+    [string]$Arg2,
+
+    # Use an existing organization folder when the target has more than one.
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string]$TargetOrg
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +58,7 @@ function Get-ClaudePackageFamily {
 function Resolve-AppRoot {
     $fam = Get-ClaudePackageFamily
     $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Claude-Data\$fam"),
         (Join-Path $env:APPDATA 'Claude'),
         (Join-Path $env:LOCALAPPDATA "Packages\$fam\LocalCache\Roaming\Claude")
     )
@@ -163,6 +169,30 @@ function Format-When {
     catch { return '' }
 }
 
+function Resolve-TargetOrg {
+    param([string]$AccountUuid, [string]$RequestedOrg)
+
+    $accountDir = Join-Path $SessionsRoot $AccountUuid
+    if ($RequestedOrg) {
+        $orgDir = Join-Path $accountDir $RequestedOrg
+        if (-not (Test-Path -LiteralPath $orgDir -PathType Container)) {
+            throw "Organization '$RequestedOrg' does not exist under account $AccountUuid. Open that organization in Claude first."
+        }
+        return $RequestedOrg
+    }
+
+    # Multiple populated organizations are ambiguous even if one has more
+    # sessions. Counts cannot establish the user's selected organization.
+    $populated = @(Get-SessionRecords -AccountUuid $AccountUuid |
+                   Select-Object -ExpandProperty Org -Unique)
+    if ($populated.Count -eq 1) { return $populated[0] }
+    if ($populated.Count -eq 0) {
+        $dirs = @(Get-ChildItem -LiteralPath $accountDir -Directory -ErrorAction SilentlyContinue)
+        if ($dirs.Count -eq 1) { return $dirs[0].Name }
+    }
+    throw "Cannot determine which organization to use under $AccountUuid. Specify -TargetOrg with an existing organization UUID."
+}
+
 try {
 
 switch ($Command) {
@@ -220,15 +250,7 @@ switch ($Command) {
         $dstAccount = Resolve-Account $Arg2
         if ($dstAccount -eq $srcAccount) { throw "Session is already under account $dstAccount." }
 
-        # Target org: the one that already holds that account's sessions.
-        $dstRecs = Get-SessionRecords -AccountUuid $dstAccount
-        $dstOrg = $null
-        if ($dstRecs) { $dstOrg = ($dstRecs | Group-Object Org | Sort-Object Count -Descending | Select-Object -First 1).Name }
-        if (-not $dstOrg) {
-            $dirs = @(Get-ChildItem (Join-Path $SessionsRoot $dstAccount) -Directory -ErrorAction SilentlyContinue)
-            if ($dirs.Count -eq 1) { $dstOrg = $dirs[0].Name }
-            else { throw "Cannot determine which org folder to use under $dstAccount. Open a session on that account first." }
-        }
+        $dstOrg = Resolve-TargetOrg -AccountUuid $dstAccount -RequestedOrg $TargetOrg
 
         $tx = Get-TranscriptIndex
         if (-not $tx.ContainsKey($src.CliId)) {

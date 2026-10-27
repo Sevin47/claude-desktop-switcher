@@ -12,8 +12,8 @@
     rejection it:
 
         1. records a cooldown for the current account, expiring at resetsAt
-        2. copies the active session into the other account's index
-        3. runs 'claude-profile.ps1 switch <other>' and relaunches the app
+        2. delegates history backup and same-organization sync to the profile switch
+        3. switches accounts and relaunches the app normally
 
     The signal is REACTIVE. There is no local usage gauge - nothing on disk
     reports how much of the week you have spent, so a limit can only be observed
@@ -33,8 +33,8 @@
                          few hours' wait)
       -IntervalSeconds   poll interval, default 5
 
-    Run this from a normal PowerShell window. It force-closes Claude when it
-    switches, which would kill a session started from inside the app.
+    Run this from a normal PowerShell window. Switching closes Claude, which
+    would stop a session started from inside the app.
 #>
 
 [CmdletBinding()]
@@ -57,9 +57,8 @@ param(
     # the other account's WEEKLY budget on.
     [int]$MinFiveHourWaitMinutes = 30,
 
-    # A rate limit blocks the whole account, so every session you were working in
-    # is stuck. On failover, carry over every session touched within this many
-    # minutes -- not just the one that made the rejected request.
+    # Retained for existing startup shortcuts and GUI callers. History sync now
+    # preserves all same-organization sessions, regardless of their age.
     [int]$CarryOverMinutes = 60,
 
     # --- Window warming (opt-in) --------------------------------------------
@@ -86,10 +85,6 @@ param(
     # so priming with a cheaper model may not anchor the window you care about.
     [string]$WarmModel = ''
 )
-
-# Above this transcript size, skip the resume deep link (which rewrites the file
-# and can exceed the app's import cap) and relaunch normally instead.
-$MaxResumeImportBytes = 5MB
 
 # Heartbeat: log an "alive" line at least this often, so a hung or dead watcher
 # is visible in the log rather than looking like a quiet, healthy one.
@@ -137,9 +132,7 @@ function Get-ClaudePackageFamily {
     return 'Claude_pzs8sxrjxfjjc'   # last-known default
 }
 
-# Was called on the switch-failed and large-transcript relaunch paths but never
-# defined here (only in claude-profile.ps1 / the GUI), so with -EA Stop the
-# watcher crashed exactly when a switch failed or a big session resumed.
+# Resolve the normal app launch target; failover never uses transcript imports.
 function Get-ClaudeAumid {
     try {
         $a = @(Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -eq 'Claude' })
@@ -151,6 +144,7 @@ function Get-ClaudeAumid {
 function Resolve-AppRoot {
     $fam = Get-ClaudePackageFamily
     $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Claude-Data\$fam"),
         (Join-Path $env:APPDATA 'Claude'),
         (Join-Path $env:LOCALAPPDATA "Packages\$fam\LocalCache\Roaming\Claude")
     )
@@ -208,9 +202,14 @@ function Show-Toast {
 # --- Identity ----------------------------------------------------------------
 
 function Get-LiveAccountUuid {
-    if (-not (Test-Path $AppConfig)) { return $null }
     try {
-        $c = Get-Content $AppConfig -Raw | ConvertFrom-Json
+        # Claude may migrate user data in either direction after a switch.
+        # Refresh the shared paths before reading identity or carrying sessions.
+        $script:AppRoot = Resolve-AppRoot
+        $script:SessionsRoot = Join-Path $script:AppRoot 'claude-code-sessions'
+        $script:AppConfig = Join-Path $script:AppRoot 'config.json'
+        if (-not (Test-Path $script:AppConfig)) { return $null }
+        $c = Get-Content $script:AppConfig -Raw | ConvertFrom-Json
         return $c.lastKnownAccountUuid
     } catch { return $null }
 }
@@ -431,6 +430,7 @@ function Invoke-WarmAccount {
 function Invoke-WarmCycle {
     param([switch]$Act)
 
+    [void](Get-LiveAccountUuid) # Refresh paths before reading desktop activity.
     $now   = Get-NowEpoch
     $map   = Get-ProfileMap
     $cool  = Get-Cooldowns
@@ -518,72 +518,6 @@ function Invoke-WarmCycle {
     return [pscustomobject]@{ Chosen = $chosen; Lines = $lines }
 }
 
-# --- Session copy ------------------------------------------------------------
-
-# The transcript filename IS the cliSessionId, so it maps back to the app's
-# index entry. Copying that entry makes the conversation resumable on the other
-# account; the .jsonl itself is already shared between both.
-# The org folder that already holds the target account's sessions.
-function Get-TargetOrgDir {
-    param([string]$ToUuid)
-    $dstAcct = Join-Path $SessionsRoot $ToUuid
-    if (-not (Test-Path $dstAcct)) { return $null }
-    $best = $null; $bestCount = -1
-    foreach ($orgDir in Get-ChildItem $dstAcct -Directory -ErrorAction SilentlyContinue) {
-        $n = @(Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue).Count
-        if ($n -gt $bestCount) { $bestCount = $n; $best = $orgDir }
-    }
-    return $best
-}
-
-function Get-AccountSessionFiles {
-    param([string]$Uuid)
-    $out = @()
-    $dir = Join-Path $SessionsRoot $Uuid
-    if (-not (Test-Path $dir)) { return $out }
-    foreach ($orgDir in Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue) {
-        foreach ($f in Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-            $out += [pscustomobject]@{ File = $f; Json = $j }
-        }
-    }
-    return $out
-}
-
-# A rate limit is ACCOUNT-wide, so every session being worked on is blocked --
-# not just the one that happened to make the rejected request. Carry over each
-# session with recent activity so parallel work survives the switch. The session
-# that triggered the limit is always included, however old its timestamp looks.
-function Copy-ActiveSessionsToAccount {
-    param([string]$FromUuid, [string]$ToUuid, [string]$AlwaysIncludeCliId, [int]$Minutes)
-
-    $dstOrg = Get-TargetOrgDir -ToUuid $ToUuid
-    if (-not $dstOrg) {
-        return [pscustomobject]@{ Copied = 0; Skipped = 0; Titles = @(); Error = 'target account has no session folder yet' }
-    }
-
-    $cutoff  = [DateTimeOffset]::UtcNow.AddMinutes(-$Minutes).ToUnixTimeMilliseconds()
-    $copied  = 0; $skipped = 0; $titles = @()
-
-    foreach ($s in Get-AccountSessionFiles -Uuid $FromUuid) {
-        $isTrigger = ($AlwaysIncludeCliId -and $s.Json.cliSessionId -eq $AlwaysIncludeCliId)
-        if (-not $isTrigger) {
-            $la = $s.Json.lastActivityAt
-            if (-not $la -or [int64]$la -lt $cutoff) { continue }
-        }
-        $dstFile = Join-Path $dstOrg.FullName $s.File.Name
-        if (Test-Path $dstFile) { $skipped++; continue }
-        try {
-            Copy-Item $s.File.FullName $dstFile -Force
-            $copied++
-            $t = $s.Json.title
-            if (-not $t) { $t = $s.Json.cliSessionId }
-            $titles += $t
-        } catch { }
-    }
-    return [pscustomobject]@{ Copied = $copied; Skipped = $skipped; Titles = $titles; Error = $null }
-}
-
 # --- Failover ----------------------------------------------------------------
 
 function Invoke-Failover {
@@ -621,78 +555,38 @@ function Invoke-Failover {
         return
     }
 
-    # Belt: make the sessions visible on the target account by copying their index
-    # entries, so they are there even if the app's own import below refuses.
-    $carry = Copy-ActiveSessionsToAccount -FromUuid $liveUuid -ToUuid $map[$target] `
-                 -AlwaysIncludeCliId $CliSessionId -Minutes $CarryOverMinutes
-    if ($carry.Error) {
-        Write-Log "  sessions: $($carry.Error)" 'Red'
-    } else {
-        Write-Log "  sessions: carried $($carry.Copied) active session(s) from the last $CarryOverMinutes min ($($carry.Skipped) already there)"
-        foreach ($t in $carry.Titles) { Write-Log "    + $t" 'DarkGray' }
+    # The profile switch closes Claude, backs up history, and synchronizes all
+    # same-organization sessions before replacing authentication. Do not copy
+    # live indexes here or import a transcript afterward: either can overwrite
+    # the preserved session mapping or discard its newer history.
+    Write-Log "Switching to '$target' ($(Get-ProfileLabel $target))..." 'Cyan'
+    # Script exit updates the global status in Windows PowerShell. A local
+    # LASTEXITCODE would hide a failed child script behind a stale zero.
+    $global:LASTEXITCODE = 0
+    try {
+        & $ProfileScript switch $target -NoLaunch *>&1 | ForEach-Object {
+            $line = ([string]$_).Trim()
+            if ($line) { Write-Log "  profile: $line" }
+        }
+        if ($global:LASTEXITCODE -ne 0) { throw "Profile switch exited with code $global:LASTEXITCODE." }
+    } catch {
+        Write-Log "Switch stopped safely: $($_.Exception.Message) Check the profile output above; close Claude manually if requested, then retry." 'Red'
+        Show-Toast 'Claude switcher: switch stopped' 'History or account checks prevented switching. See autoswitch.log for the required action.'
+        return
     }
 
-    Write-Log "Switching to '$target' ($(Get-ProfileLabel $target))..." 'Cyan'
-    & $ProfileScript switch $target -NoLaunch
-
-    # Do NOT test $LASTEXITCODE here: claude-profile.ps1 only calls exit on
-    # failure, so on success it stays null and '-eq 0' reports a false failure.
-    # Ask the app which account it is actually on instead.
+    # Verify identity even when the profile command reports success.
     Start-Sleep -Milliseconds 800
     $nowUuid = Get-LiveAccountUuid
     if ($nowUuid -ne $map[$target]) {
         if ($nowUuid -eq $liveUuid) { Write-Log "Switch did not take - still on the limited account." 'Red' }
         else { Write-Log "Switch finished but the account reads as $nowUuid - check with 'status'." 'Yellow' }
-        Show-Toast 'Claude switcher: switch failed' 'Still on the rate-limited account. See autoswitch.log.'
-        Start-Process ('shell:AppsFolder\' + (Get-ClaudeAumid))
+        Show-Toast 'Claude switcher: switch failed' 'The target account could not be confirmed. See autoswitch.log.'
         return
     }
 
-    # The resume deep link makes the app REWRITE the transcript in place (it warns
-    # it "may fail if this exceeds the SDK prompt-size cap"). For a big transcript
-    # that risks a failed import on a mutated file, so above a safe size just
-    # relaunch normally -- the copied index entry already makes the session
-    # reachable from the list.
-    $txSize = 0
-    $txFile = Get-TranscriptPath $CliSessionId
-    if ($txFile) { $txSize = (Get-Item $txFile).Length }
-
-    if ($txSize -gt $MaxResumeImportBytes) {
-        Write-Log "  transcript is $([int]($txSize/1MB))MB (> $([int]($MaxResumeImportBytes/1MB))MB) - relaunching normally, session is in the list." 'DarkGray'
-        Start-Process ('shell:AppsFolder\' + (Get-ClaudeAumid))
-    } else {
-        # Verified in the app bundle: claude://resume?session=<id> -> importCliSession,
-        # which files the session as local_<cliSessionId> (keeping a .pre-import
-        # copy of the transcript). Opens straight into the conversation.
-        Write-Log "  relaunching into the session via claude://resume" 'DarkGray'
-        Start-Process "claude://resume?session=$CliSessionId"
-
-        # If the import succeeded there are now two index entries for one
-        # transcript. Drop ours; the app's is canonical.
-        #
-        # Poll rather than sleeping once: the app has to launch, handle the URI
-        # and rewrite the transcript, which routinely takes longer than a few
-        # seconds. A single short wait reports a false "did not import" and
-        # leaves the duplicate behind.
-        $tgtDir  = Join-Path $SessionsRoot $map[$target]
-        $appMade = Join-Path (Join-Path $tgtDir '*') "local_$CliSessionId.json"
-        for ($w = 0; $w -lt 30; $w++) {
-            Start-Sleep -Seconds 1
-            if (Test-Path $appMade) { break }
-        }
-        if (Test-Path $appMade) {
-            foreach ($f in Get-ChildItem $tgtDir -Recurse -Filter 'local_*.json' -ErrorAction SilentlyContinue) {
-                if ($f.Name -eq "local_$CliSessionId.json") { continue }
-                try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-                if ($j.cliSessionId -eq $CliSessionId) {
-                    Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
-                    Write-Log "  app imported the session itself; removed duplicate $($f.Name)" 'DarkGray'
-                }
-            }
-        } else {
-            Write-Log "  app did not import via deep link; the copied entry stands (find it in the session list)" 'DarkGray'
-        }
-    }
+    Write-Log '  history sync completed through the profile switch; relaunching Claude normally.' 'DarkGray'
+    Start-Process ('shell:AppsFolder\' + (Get-ClaudeAumid))
 
     # Confirm the new account actually held. A dead/rotated refresh token would
     # let the switch complete on disk but bounce the app to a login screen; the
@@ -709,12 +603,8 @@ function Invoke-Failover {
     $fromLabel = if ($fromName) { Get-ProfileLabel $fromName } else { $liveUuid.Substring(0,8) + '...' }
 
     if ($held) {
-        Write-Log "Switched to $(Get-ProfileLabel $target). Re-send your last message." 'Green'
-        $extra = ''
-        if ($carry -and -not $carry.Error -and $carry.Copied -gt 1) {
-            $extra = " $($carry.Copied) active sessions carried over."
-        }
-        Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Re-send your last message.$extra"
+        Write-Log "Switched to $(Get-ProfileLabel $target). Open your conversation in Code and resend the last message when ready." 'Green'
+        Show-Toast "Claude: switched to $(Get-ProfileLabel $target)" "$LimitType limit on $fromLabel. Open the conversation in Code and resend your last message."
     } else {
         # Do not spend more accounts chasing this - the profile may be signed out.
         Write-Log "Switched, but could not confirm $(Get-ProfileLabel $target) stayed signed in - its saved session may have expired. Re-save that profile while signed into it." 'Red'
@@ -727,13 +617,6 @@ function Invoke-Failover {
 function Get-TranscriptFiles {
     if (-not (Test-Path $ProjectsRoot)) { return @() }
     return Get-ChildItem $ProjectsRoot -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue
-}
-
-function Get-TranscriptPath {
-    param([string]$CliSessionId)
-    $f = Get-ChildItem $ProjectsRoot -Recurse -Filter "$CliSessionId.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($f) { return $f.FullName }
-    return $null
 }
 
 # Returns the new byte offset, having handed each COMPLETE line to the callback.

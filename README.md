@@ -1,8 +1,9 @@
 # Claude Desktop Account Switcher (Windows)
 
-Keep two Claude accounts signed in at once and switch between them without
-re-authenticating. Optionally fail over automatically when one hits its rate
-limit, carrying the conversation across.
+Keep two saved Claude account profiles and switch between them without
+re-authenticating. Each switch backs up and synchronizes the latest local Claude
+Code history before changing accounts. Optional rate-limit failover uses the
+same switching path.
 
 Built for the **Claude desktop app on Windows**. If you use the Claude Code CLI
 instead, use [claude-swap](https://github.com/realiti4/claude-swap) — it targets
@@ -14,8 +15,9 @@ doesn't reach it.
 
 ## What it does
 
-- **Switch accounts in ~1 second**, no re-login
-- **Move a conversation between accounts** and continue it where you left off
+- **Switch saved accounts**, with a normal app shutdown and no re-login
+- **Synchronize local Claude Code history** between accounts in the same organization
+- **Back up history before switching**, retaining newer destination work
 - **Watch for rate limits** and fail over automatically when one is exhausted
 - **A GUI**, so none of this needs a terminal
 
@@ -26,21 +28,28 @@ doesn't reach it.
   `Program Files\WindowsApps`). A standalone-installer build won't work — paths
   and relaunch differ.
 - Windows PowerShell 5.1 (ships with Windows)
+- Node.js **18 or newer**, with `node.exe` available on `PATH`
 - Two Claude accounts, each with its own subscription
+- For history sync, both accounts must already have a local session directory
+  for the **same organization UUID**. Open that organization in each account first.
 
 ## Install
 
-Put all five files in one folder, e.g. `Documents\claude-switcher`:
+Keep these files in one folder, e.g. `Documents\claude-switcher`:
 
 ```
 claude-switcher-gui.ps1     the GUI
 claude-profile.ps1          account switching
 claude-sessions.ps1         moving conversations
 claude-autoswitch.ps1       rate-limit watcher
+claude-history-sync.mjs     history validation, backups, sync and recovery
 README.md
+LICENSE
 ```
 
-They must stay together — the GUI resolves the others relative to itself.
+They must stay together — the GUI and profile switcher resolve their companion
+files relative to themselves. No npm packages are required. You can verify the
+Node.js requirement with `node --version`.
 
 Then, in PowerShell:
 
@@ -103,6 +112,20 @@ Anthropic's artwork, so generate it locally rather than committing it.
 
 After that, **double-click an account to switch to it**.
 
+Before saving or switching, exit Claude normally so its latest session data is
+flushed. The switcher can request a normal window close, but it never force-kills
+Claude. If the app stays in the tray, a quit confirmation remains open, or Claude
+workers are still running, the operation stops. Use Claude's **File → Exit** and
+retry after it has fully exited. A failed close does not change accounts or
+history.
+
+Every successful account change synchronizes all local Claude Code session
+entries from the outgoing account into matching organization folders. Existing
+destination IDs are retained, newer destination history is kept, and new local
+entries are added. Claude launches normally afterward; open the desired Code
+conversation to continue. The switcher does not send task prompts or use a
+session-resume deep link. Claude's own task recovery is separate from switching.
+
 ## Auto-switching (optional)
 
 On the **Auto-switch** tab:
@@ -119,18 +142,20 @@ On the **Auto-switch** tab:
 When a limit is hit, the watcher:
 
 1. records the account's cooldown from `resetsAt`
-2. copies **every session you were working in** to the other account — not just
-   the one that made the rejected request. A rate limit blocks the whole
-   account, so any session touched in the last `-CarryOverMinutes` (default 60)
-   comes across; the session that triggered the limit is always included
-3. switches profiles (Claude closes)
-4. relaunches through `claude://resume?session=<id>`, so the app opens straight
-   into the conversation, then drops the copied entry if the app's own import
-   succeeded
+2. requests a normal Claude shutdown and stops if the app or its workers remain
+   running
+3. validates and backs up the history, synchronizes all local Code sessions into
+   matching organization folders, then switches profiles
+4. relaunches Claude normally, with the synchronized sessions available in Code
 5. raises a Windows toast saying what happened and which account you're on now
 
-The turn that hit the limit is lost — re-send it. If every account is limited it
-stays put and toasts the earliest reset time.
+The rejected request is not re-sent automatically. Open the conversation and
+review where it stopped before continuing. If every account is limited, the
+watcher stays put and toasts the earliest reset time.
+
+`-CarryOverMinutes` is still accepted so existing shortcuts and GUI settings
+continue to work, but it no longer limits history sync. All outgoing local Code
+session entries are considered, regardless of age.
 
 Everything it sees goes to `%USERPROFILE%\.claude-profiles\autoswitch.log`.
 
@@ -139,11 +164,10 @@ Everything it sees goes to `%USERPROFILE%\.claude-profiles\autoswitch.log`.
 Launch the watcher from the **GUI's Start button**, the **Desktop shortcut**, or the
 **login entry** — never from a shell hosted inside the Claude app itself.
 
-A switch force-kills every `claude.exe` process. Anything launched *from* a
-session inside Claude is owned by that session, so the switch can take the
-watcher (or the GUI) down with it. The symptom is confusing: the app comes back
-on the new account and looks fine, but the watcher is silently gone and nothing
-is logged, because it was killed rather than exiting.
+A switch requires Claude to exit normally. Anything launched *from* a session
+inside Claude may end with that session, including the watcher or GUI. Starting
+the switcher independently lets it finish the backup and account change after
+Claude closes.
 
 To check what owns a running watcher:
 
@@ -165,14 +189,15 @@ not `claude`.
 | `New transcript: <file>` | a session created after the watcher started |
 | `<type> limit hit on <uuid>... - cooling down until <time>` | a genuine rejection was detected |
 | `DRY RUN: would switch to ...` | detected but not acting (dry run) |
-| `Switched to <account>. Re-send your last message.` | failover completed |
+| `Switched to <account>. Open your conversation in Code ...` | failover completed; the switcher sent no continuation prompt |
+| `history sync completed through the profile switch ...` | history validation, backup and sync completed |
 | `resets in N min (< M) - waiting ...` | five-hour limit too short to be worth switching |
 | `POSSIBLE FORMAT CHANGE ...` | a Claude API-error record no longer matches the known shape — run `selftest` |
 | `watch-loop error (continuing): ...` | a transient error was survived, not fatal |
 | `The switcher scripts changed on disk ...` | the running watcher is on stale code; restart it |
 
-A gap in the heartbeats with no other line means the watcher was **killed**
-(see above) rather than failing — it always logs its own errors.
+A gap in the heartbeats with no other line can mean the watcher ended with its
+parent process. Check whether it is still running; handled errors are logged.
 
 To confirm a switch actually landed, don't rely on the log alone:
 
@@ -238,28 +263,58 @@ about. Left unset it uses the CLI default.
 
 ## How it works
 
-Your login lives in six places. Switching accounts swaps all six and restarts
-the app:
+Your login lives in six places. After history validation and synchronization,
+switching accounts swaps all six and relaunches the app:
 
 | Path | Holds |
 |---|---|
-| `%APPDATA%\Claude\config.json` | `oauth:tokenCacheV2`, `lastKnownAccountUuid` |
-| `%APPDATA%\Claude\Local State` | DPAPI-wrapped AES key for the cookies |
-| `%APPDATA%\Claude\Network\` | cookie database |
-| `%APPDATA%\Claude\Local Storage\` | web session state |
-| `%APPDATA%\Claude\Session Storage\` | web session state |
+| `<AppRoot>\config.json` | `oauth:tokenCacheV2`, `lastKnownAccountUuid` |
+| `<AppRoot>\Local State` | DPAPI-wrapped AES key for the cookies |
+| `<AppRoot>\Network\` | cookie database |
+| `<AppRoot>\Local Storage\` | web session state |
+| `<AppRoot>\Session Storage\` | web session state |
 | `%USERPROFILE%\.claude.json` | Claude Code CLI config |
 
 Profiles are saved under `%USERPROFILE%\.claude-profiles\<name>\`.
 
-Two things worth knowing:
+`<AppRoot>` is detected from the current Store app data location. The resolver
+prefers `%LOCALAPPDATA%\Claude-Data\<package-family>`, then checks
+`%APPDATA%\Claude` and the legacy
+`%LOCALAPPDATA%\Packages\<package-family>\LocalCache\Roaming\Claude` location.
+Claude updates can migrate data between these paths.
 
 **Conversation transcripts are already shared between accounts.** They live in
 `%USERPROFILE%\.claude\projects\<project>\<cliSessionId>.jsonl`, which is not
-account-scoped. Only the *session index* under
-`%APPDATA%\Claude\claude-code-sessions\<accountUuid>\<orgUuid>\` is per-account.
-So moving a conversation copies one small JSON file — the history itself never
-moves, and both accounts read the same file.
+account-scoped. The *session index* under
+`<AppRoot>\claude-code-sessions\<accountUuid>\<orgUuid>\` is per-account.
+The history engine updates these index entries while preserving their transcript,
+compaction, rewind and model-history links. It does not rewrite or delete the
+shared transcripts. Existing aliases keep their destination local ID, with
+structural child-session references remapped to it.
+
+Before updating any destination index, the engine validates the histories and
+backs up both account index trees, the referenced shared transcripts and their
+supporting session files. Backups are stored under:
+
+```
+%USERPROFILE%\.claude-profiles\.history-backups\
+  transactions\<timestamp-and-id>\transaction.json
+  blobs\sha256\<prefix>\<content-hash>
+```
+
+Each transaction records its original files, checksums, staged updates and
+recovery state. Content-addressed blobs are shared between transactions, so
+unchanged files are stored once. Checksums are verified before changes are
+applied. Backups remain available after a successful switch and accumulate as
+history changes; they are separate from the six-file account profile snapshot.
+
+The engine refreshes an existing destination only when the source contains its
+history. If the destination is newer, it is kept. Divergent branches, ambiguous
+aliases, missing transcripts or matching organizations, deletion conflicts, and
+distinct pending notes stop the switch for review. Source indices remain
+unchanged. History sync covers **local desktop Claude Code sessions in matching
+organization UUIDs**; it does not synchronize web chats, Cowork history, or remote
+cloud session history.
 
 **Rate-limit detection is reactive.** Claude Code writes a `quotaLimits` record
 into the session transcript when a request is refused:
@@ -268,9 +323,8 @@ into the session transcript when a request is refused:
 {"status":"rejected","resetsAt":1788223800,"rateLimitType":"seven_day"}
 ```
 
-That's the only local signal — nothing on disk reports how much of your quota is
-spent, so a limit can only be seen *after* a request is refused. The turn that
-triggers it is lost and must be re-sent after the switch.
+The watcher responds to these rejection records rather than predicting remaining
+quota. It does not re-send the rejected request after switching.
 
 ## Robustness
 
@@ -279,9 +333,16 @@ so the tool guards the failure modes that come with that:
 
 - **One switch at a time.** A cross-process lock stops the watcher and a manual
   switch from mutating the same files at once (which could corrupt the store).
-- **Crash recovery.** A switch that dies mid-copy (power loss, killed process)
-  is detected at next launch and repaired by re-applying the target profile,
-  which stays intact in the store. `doctor` shows a pending repair.
+- **Normal shutdown only.** The switcher waits for Claude and its file handles
+  to close. A tray-resident app or remaining worker stops the operation; there is
+  no force-kill fallback.
+- **Verified history backups.** Source and destination indices, referenced
+  transcripts and supporting files are checksummed before destination changes.
+  Changed files or conflicting histories stop the switch before account restore.
+- **Crash recovery.** Account restores retain a recovery marker; history updates
+  retain a transaction journal and verified originals. On a subsequent run with
+  Claude closed, the tool completes or rolls back the interrupted history update
+  according to the active account. Recovery refuses to overwrite newer changes.
 - **Integrity checks.** A profile is only "ok" if its `config.json` parses with
   an account UUID and its cookie DB is non-empty — not merely that files exist.
 - **Format-drift tripwire.** If a rate-limit line appears that the watcher
@@ -290,8 +351,8 @@ so the tool guards the failure modes that come with that:
   works on demand.
 - **Dead-session check.** After a switch it confirms the app stayed on the new
   account; if a saved session has expired it says so rather than looping.
-- **Large-session guard.** Very large transcripts skip the resume deep link (it
-  rewrites the file) and relaunch normally instead.
+- **Normal relaunch.** Every transcript size uses the same normal app launch.
+  The switcher does not invoke a resume deep link or submit a continuation prompt.
 - **Heartbeat.** The watcher logs an "alive" line periodically, so a hung one is
   visible in the log rather than looking healthy.
 
@@ -307,7 +368,12 @@ loud and recoverable instead of silent.
 - **One account at a time.** The desktop app has no multi-account support —
   `lastKnownAccountUuid` is singular. This swaps the whole session; it doesn't
   run two at once.
-- **Switching closes the app.** About a second, plus relaunch.
+- **Switching requires the app to close.** Backup and validation time depends on
+  the amount of history and disk speed. Running tasks may be interrupted by a
+  normal exit; the switcher does not resume or rerun them itself.
+- **Matching local organizations only.** A missing destination organization or
+  incompatible history stops switching. No web or remote cloud conversations are
+  transferred.
 - **The app's own account menu switches only the Chat/Cowork session**, not
   Claude Code. They authenticate separately. Use a full Log out to move both.
 - Detection matches a private, undocumented record shape and could break with an
@@ -357,6 +423,26 @@ The GUI covers everything, but each script runs standalone:
 
 `doctor` prints resolved paths and whether each source file is readable — start
 there if something doesn't work.
+
+`claude-sessions.ps1 copy` remains a manual command for a selected index entry.
+The full validation, backup and latest-history synchronization described above
+run through `claude-profile.ps1 switch`, including switches initiated by the GUI
+or watcher. Use `switch <name> -NoLaunch` to leave Claude closed afterward.
+
+## Tests
+
+From a repository checkout that includes the `tests` directory, run the three
+synthetic suites:
+
+```powershell
+node --test .\tests\history-sync.test.mjs
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\profile-history.test.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\autoswitch-history.test.ps1
+```
+
+These use temporary fixtures and mocked lifecycle calls. They do not stop Claude,
+switch real accounts, or modify live sessions. They cover history ancestry and
+aliases, backups and recovery, profile integration, and watcher delegation.
 
 ## Credits
 
